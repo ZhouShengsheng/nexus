@@ -26,6 +26,7 @@ def parse_int_list(s):
 
 
 def load_model_db(path):
+    """Load models specified by yaml file in path to global _models."""
     with open(path) as f:
         model_db = yaml.load(f.read())
     for model_info in model_db['models']:
@@ -47,17 +48,24 @@ def load_model_db(path):
 
 
 def find_max_batch(framework, model_name, gpus):
+    """Find batch size which produces the best throughput by try and error."""
     global args
+    # cmd is used to start subprocess (profiler written in cpp) to profile the model given specific batch size
     cmd_base = '%s -model_root %s -image_dir %s -gpu %s -framework %s -model %s -model_version %s' % (
         _profiler, args.model_root, args.dataset, gpus[0], framework, model_name, args.version)
     if args.height > 0 and args.width > 0:
         cmd_base += ' -height %s -width %s' % (args.height, args.width)
     if args.prefix:
         cmd_base += ' -share_prefix'
+    # left and right means the min and max batch sizes for the cmd
     left = 0
     right = 256
+    # Current throughput for batch right, throughput is calculated by:
+    #   tps = right * 1e6 / latency
+    #   latency = mean time + std time
     curr_tp = None
     out_of_memory = False
+    # Find max batch size by evaluating model given increasing batch sizes
     while True:
         prev_tp = curr_tp
         curr_tp = None
@@ -86,12 +94,14 @@ def find_max_batch(framework, model_name, gpus):
             print(err)
             exit(1)
         print('batch %s: throughput %s' % (right, curr_tp))
+        # If new throughput is lower than current throughput, we found the max batch size
         if prev_tp is not None and curr_tp / prev_tp < 1.01:
             break
         left = right
         right *= 2
     if not out_of_memory:
         return right
+    # Out of memory occurred, use binary search to determine the max batch
     while right - left > 1:
         print(left, right)
         mid = (left + right) // 2
@@ -108,6 +118,7 @@ def find_max_batch(framework, model_name, gpus):
 
 
 def run_profiler(gpu, prof_id, input_queue, output_queue):
+    """Worker process to perform a profile task on a specific gpu."""
     while True:
         cmd = input_queue.get()
         if cmd is None:
@@ -146,7 +157,20 @@ def run_profiler(gpu, prof_id, input_queue, output_queue):
 
 
 def profile_model(framework, model_name, min_batch_limit, max_batch_limit, gpus):
+    """
+    Profile a model batch sizes ranging from min_batch_limit to max_batch_limit.
+    The profile result contains gpu, batch size, inference latency,
+    pre-processing latency and post-processing latency for each batch size.
+
+    Args:
+        framework: Backend framework for the model like tensorflow and caffe2.
+        model_name: Concrete model to profile.
+        min_batch_limit: Min batch size to profile.
+        max_batch_limit: Max batch size to profile.
+        gpus: Profile task will run on all gpus specified here.
+    """
     global args
+    # Determine profile task id (framework:model_name:version:widthxheight)
     prof_id = '%s:%s:%s' % (framework, model_name, args.version)
     if args.height > 0 and args.width > 0:
         prof_id += ':%sx%s' % (args.height, args.width)
@@ -164,11 +188,14 @@ def profile_model(framework, model_name, min_batch_limit, max_batch_limit, gpus)
 
     input_queue = multiprocessing.Queue(max_batch - min_batch + 1)
     output_queue = multiprocessing.Queue(max_batch - min_batch + 1)
+
+    # Start workers for different gpu
     workers = []
     for gpu in gpus:
         worker = multiprocessing.Process(target=run_profiler, args=(gpu, prof_id, input_queue, output_queue))
         worker.start()
         workers.append(worker)
+    # Put tasks for different batch sizes
     for batch in range(min_batch, max_batch + 1):
         cmd = [_profiler,
                f'-model_root={args.model_root}', f'-image_dir={args.dataset}',
@@ -184,6 +211,7 @@ def profile_model(framework, model_name, min_batch_limit, max_batch_limit, gpus)
         input_queue.put(None)
     input_queue.close()
 
+    # Save profile result to file
     output = str(uuid.uuid4()) + '.txt'
     forward_stats = []
     preprocess_lats = []
